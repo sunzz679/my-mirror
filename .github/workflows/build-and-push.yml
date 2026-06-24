@@ -1,27 +1,19 @@
-name: Dynamic Manual Sync Image (No Dockerfile Needed)
+name: Super Smart Image Sync (One-Click)
 
 on:
   workflow_dispatch:
     inputs:
-      upstream_image:
-        description: '源镜像地址 (例如: quay.io/ceph/ceph)'
+      upstream_full_image:
+        description: '请输入完整源镜像地址 (例如: quay.io/cephcsi/cephcsi:v3.17.0)'
         required: true
-        default: 'quay.io/ceph/ceph'
-      image_name:
-        description: '阿里云上的镜像名 (例如: ceph)'
-        required: true
-        default: 'ceph'
-      image_version:
-        description: '镜像版本号 (例如: v19.2.4)'
-        required: true
-        default: 'v19.2.4'
+        default: 'quay.io/cephcsi/cephcsi:v3.17.0'
 
 jobs:
   sync-image:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. 登录阿里云
+    # 1. 登录阿里云容器镜像服务
     - name: Log in to Alibaba Cloud ACR
       uses: docker/login-action@v3
       with:
@@ -29,16 +21,59 @@ jobs:
         username: ${{ secrets.ACR_USERNAME }}
         password: ${{ secrets.ACR_PASSWORD }}
 
-    # 2. 直接从官方源拉取、改名、推送到阿里云（完全不需要仓库里有 Dockerfile）
+    # 2. 核心魔法：智能解析镜像地址
+    - name: Parse Image Address
+      id: parser
+      run: |
+        FULL_INPUT="${{ github.event.inputs.upstream_full_image }}"
+        echo "原始输入: $FULL_INPUT"
+        
+        # 提取版本号（截取最后一个冒号后面的全部内容）
+        IMG_VER="${FULL_INPUT##*:}"
+        
+        # 提取不带版本号的基础路径（截取最后一个冒号前面的全部内容）
+        IMG_BASE="${FULL_INPUT%:*}"
+        
+        # 判断并剔除注册中心域名（如果第一段路径里包含点 '.'，则认为是域名）
+        FIRST_PART=$(echo "$IMG_BASE" | cut -d'/' -f1)
+        if [[ "$FIRST_PART" =~ \. ]]; then
+          # 剔除域名，保留后续路径
+          IMG_PATH=$(echo "$IMG_BASE" | cut -d'/' -f2-)
+        else
+          IMG_PATH="$IMG_BASE"
+        fi
+        
+        # 将路径中的所有斜杠 '/' 替换为横杠 '-'
+        IMG_NAME=$(echo "$IMG_PATH" | tr '/' '-')
+        
+        # 将解析出来的变量传递给后续的 Action 步骤
+        echo "target_name=$IMG_NAME" >> $GITHUB_OUTPUT
+        echo "target_version=$IMG_VER" >> $GITHUB_OUTPUT
+        
+        # 在日志里打印一下，方便肉眼确认
+        echo "----------------------------------------"
+        echo "解析成功！"
+        echo "-> 最终阿里云镜像名: $IMG_NAME"
+        echo "-> 最终阿里云版本号: $IMG_VER"
+        echo "----------------------------------------"
+
+    # 3. 执行拉取、改名和推送
     - name: Pull, Tag and Push
       run: |
-        # 拉取官方镜像
-        docker pull ${{ github.event.inputs.upstream_image }}:${{ github.event.inputs.image_version }}
+        # 快捷引用上一步解析出来的变量
+        SRC_IMAGE="${{ github.event.inputs.upstream_full_image }}"
+        REGISTRY="${{ secrets.ACR_REGISTRY }}"
+        NAMESPACE="${{ secrets.ACR_NAMESPACE }}"
+        TAG_NAME="${{ steps.parser.outputs.target_name }}"
+        TAG_VER="${{ steps.parser.outputs.target_version }}"
         
-        # 打上阿里云私有仓的标签
-        docker tag ${{ github.event.inputs.upstream_image }}:${{ github.event.inputs.image_version }} ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ github.event.inputs.image_name }}:${{ github.event.inputs.image_version }}
-        docker tag ${{ github.event.inputs.upstream_image }}:${{ github.event.inputs.image_version }} ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ github.event.inputs.image_name }}:latest
+        # 执行 Docker 命令
+        docker pull $SRC_IMAGE
+        
+        # 打标签 (同时生成具体版本号和 latest)
+        docker tag $SRC_IMAGE $REGISTRY/$NAMESPACE/$TAG_NAME:$TAG_VER
+        docker tag $SRC_IMAGE $REGISTRY/$NAMESPACE/$TAG_NAME:latest
         
         # 推送到阿里云
-        docker push ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ github.event.inputs.image_name }}:${{ github.event.inputs.image_version }}
-        docker push ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ github.event.inputs.image_name }}:latest
+        docker push $REGISTRY/$NAMESPACE/$TAG_NAME:$TAG_VER
+        docker push $REGISTRY/$NAMESPACE/$TAG_NAME:latest
